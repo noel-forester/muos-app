@@ -37,6 +37,8 @@ class StartMenuOptions:
     ABORT_DOWNLOAD = f"{glyphs.abort} Abort downloads"
     SD_SWITCH = f"{glyphs.microsd} Switch SD card"
     TOGGLE_LAYOUT = f"{glyphs.user} Toggle button layout"
+    SAVEDATA = f"{glyphs.download} Savedata"
+    STATESAVE = f"{glyphs.download} Statesave"
     EXIT = f"{glyphs.exit} Exit"
 
 
@@ -58,6 +60,8 @@ class RomM:
         self.platforms_selected_position = 0
         self.collections_selected_position = 0
         self.roms_selected_position = 0
+        self.saves_selected_position = 0
+        self.states_selected_position = 0
 
         self.max_n_platforms = 10
         self.max_n_collections = 10
@@ -81,7 +85,9 @@ class RomM:
                 StartMenuOptions.TOGGLE_LAYOUT,
                 2 if self.fs._sd2_roms_storage_path else 1,
             ),
-            (StartMenuOptions.EXIT, 3 if self.fs._sd2_roms_storage_path else 2),
+            (StartMenuOptions.SAVEDATA, 3 if self.fs._sd2_roms_storage_path else 2),
+            (StartMenuOptions.STATESAVE, 4 if self.fs._sd2_roms_storage_path else 3),
+            (StartMenuOptions.EXIT, 5 if self.fs._sd2_roms_storage_path else 4),
         ]
 
     def draw_buttons(self):
@@ -622,6 +628,252 @@ class RomM:
                 len(self.status.roms_to_show),
             )
 
+    def _render_saves_view(self):
+        if self.status.saves_ready.is_set():
+            self.ui.draw_saves_list(
+                self.saves_selected_position,
+                self.max_n_roms,  # 同じ最大数を使用
+                self.status.saves,
+                fill=self.controller_layout["a"]["color"],
+            )
+        if not self.status.saves_ready.is_set():
+            current_time = time.time()
+            if current_time - self.last_spinner_update >= self.spinner_speed:
+                self.last_spinner_update = current_time
+                self.current_spinner_status = next(glyphs.spinner)
+            self.ui.draw_log(
+                text_line_1=f"{self.current_spinner_status} Fetching savedata"
+            )
+        elif not self.status.download_rom_ready.is_set():
+            if self.status.extracting_rom and self.status.downloading_rom:
+                self.ui.draw_loader(
+                    self.status.extracted_percent,
+                    color=self.controller_layout["b"]["color"],
+                )
+                self.ui.draw_log(
+                    text_line_1=f"{self.status.downloading_rom_position}/{len(self.status.download_queue)} | {self.status.extracted_percent:.2f}% | Extracting {self.status.downloading_rom.name}",
+                    text_line_2=f"({self.status.downloading_rom.fs_name})",
+                    background=False,
+                )
+            elif self.status.downloading_rom:
+                self.ui.draw_loader(self.status.downloaded_percent)
+                self.ui.draw_log(
+                    text_line_1=f"{self.status.downloading_rom_position}/{len(self.status.download_queue)} | {self.status.downloaded_percent:.2f}% | {glyphs.download} {self.status.downloading_rom.name}",
+                    text_line_2=f"({self.status.downloading_rom.fs_name})",
+                    background=False,
+                )
+        elif not self.status.valid_host:
+            self.ui.draw_log(
+                text_line_1=f"Error: Can't connect to host {self.api.host}",
+                text_color=self.controller_layout["a"]["color"],
+            )
+            self.status.valid_host = True
+        elif not self.status.valid_credentials:
+            self.ui.draw_log(
+                text_line_1="Error: Permission denied",
+                text_color=self.controller_layout["a"]["color"],
+            )
+            self.status.valid_credentials = True
+        else:
+            self.buttons_config = [
+                {
+                    "key": self.controller_layout["a"]["btn"],
+                    "label": "Select",
+                    "color": self.controller_layout["a"]["color"],
+                },
+                {
+                    "key": self.controller_layout["b"]["btn"],
+                    "label": "Back",
+                    "color": self.controller_layout["b"]["color"],
+                },
+                {
+                    "key": self.controller_layout["y"]["btn"],
+                    "label": "Refresh",
+                    "color": self.controller_layout["y"]["color"],
+                },
+            ]
+            self.draw_buttons()
+
+    def _update_saves_view(self):
+        if self.input.key(self.controller_layout["a"]["key"]):
+            if (
+                self.status.saves_ready.is_set()
+                and len(self.status.saves) > 0
+            ):
+                selected_save = self.status.saves[self.saves_selected_position]
+                self.status.selected_save = selected_save
+                
+                # セーブデータをダウンロード
+                downloaded_path = self.api.download_save(selected_save.id, selected_save.file_name)
+                if downloaded_path:
+                    self.ui.draw_log(
+                        text_line_1=f"Save downloaded: {selected_save.file_name_no_tags}",
+                        text_line_2=f"Location: {downloaded_path}"
+                    )
+                else:
+                    self.ui.draw_log(
+                        text_line_1=f"Failed to download save: {selected_save.file_name_no_tags}",
+                        text_line_2="Check network connection and permissions"
+                    )
+        elif self.input.key(self.controller_layout["b"]["key"]):
+            self.status.current_view = View.PLATFORMS
+            self.status.selected_save = None
+            self.status.reset_saves_list()
+            self.saves_selected_position = 0
+        elif self.input.key(self.controller_layout["y"]["key"]):
+            if self.status.saves_ready.is_set():
+                self.status.saves_ready.clear()
+                threading.Thread(target=self.api.fetch_saves).start()
+        elif self.input.key("START"):
+            self.status.show_contextual_menu = not self.status.show_contextual_menu
+            if self.status.show_contextual_menu and len(self.status.saves) > 0:
+                selected_save = self.status.saves[self.saves_selected_position]
+                self.contextual_menu_options = [
+                    (
+                        f"{glyphs.about} Save info",
+                        0,
+                        lambda: self.ui.draw_log(
+                            text_line_1=f"Save: {selected_save.file_name_no_tags}",
+                            text_line_2=f"Size: {self.api._human_readable_size(selected_save.file_size_bytes)[0]} {self.api._human_readable_size(selected_save.file_size_bytes)[1]} | Updated: {selected_save.updated_at}"
+                        ),
+                    ),
+                ]
+            else:
+                self.contextual_menu_options = []
+        else:
+            # Reset position if list is empty to avoid out-of-bounds
+            if len(self.status.saves) == 0:
+                self.saves_selected_position = 0
+            else:
+                self.saves_selected_position = self.input.handle_navigation(
+                    self.saves_selected_position,
+                    self.max_n_roms,  # 同じ最大数を使用
+                    len(self.status.saves),
+                )
+
+    def _render_states_view(self):
+        if self.status.states_ready.is_set():
+            self.ui.draw_states_list(
+                self.states_selected_position,
+                self.max_n_roms,  # 同じ最大数を使用
+                self.status.states,
+                fill=self.controller_layout["a"]["color"],
+            )
+        if not self.status.states_ready.is_set():
+            current_time = time.time()
+            if current_time - self.last_spinner_update >= self.spinner_speed:
+                self.last_spinner_update = current_time
+                self.current_spinner_status = next(glyphs.spinner)
+            self.ui.draw_log(
+                text_line_1=f"{self.current_spinner_status} Fetching statesave"
+            )
+        elif not self.status.download_rom_ready.is_set():
+            if self.status.extracting_rom and self.status.downloading_rom:
+                self.ui.draw_loader(
+                    self.status.extracted_percent,
+                    color=self.controller_layout["b"]["color"],
+                )
+                self.ui.draw_log(
+                    text_line_1=f"{self.status.downloading_rom_position}/{len(self.status.download_queue)} | {self.status.extracted_percent:.2f}% | Extracting {self.status.downloading_rom.name}",
+                    text_line_2=f"({self.status.downloading_rom.fs_name})",
+                    background=False,
+                )
+            elif self.status.downloading_rom:
+                self.ui.draw_loader(self.status.downloaded_percent)
+                self.ui.draw_log(
+                    text_line_1=f"{self.status.downloading_rom_position}/{len(self.status.download_queue)} | {self.status.downloaded_percent:.2f}% | {glyphs.download} {self.status.downloading_rom.name}",
+                    text_line_2=f"({self.status.downloading_rom.fs_name})",
+                    background=False,
+                )
+        elif not self.status.valid_host:
+            self.ui.draw_log(
+                text_line_1=f"Error: Can't connect to host {self.api.host}",
+                text_color=self.controller_layout["a"]["color"],
+            )
+            self.status.valid_host = True
+        elif not self.status.valid_credentials:
+            self.ui.draw_log(
+                text_line_1="Error: Permission denied",
+                text_color=self.controller_layout["a"]["color"],
+            )
+            self.status.valid_credentials = True
+        else:
+            self.buttons_config = [
+                {
+                    "key": self.controller_layout["a"]["btn"],
+                    "label": "Select",
+                    "color": self.controller_layout["a"]["color"],
+                },
+                {
+                    "key": self.controller_layout["b"]["btn"],
+                    "label": "Back",
+                    "color": self.controller_layout["b"]["color"],
+                },
+                {
+                    "key": self.controller_layout["y"]["btn"],
+                    "label": "Refresh",
+                    "color": self.controller_layout["y"]["color"],
+                },
+            ]
+            self.draw_buttons()
+
+    def _update_states_view(self):
+        if self.input.key(self.controller_layout["a"]["key"]):
+            if (
+                self.status.states_ready.is_set()
+                and len(self.status.states) > 0
+            ):
+                selected_state = self.status.states[self.states_selected_position]
+                self.status.selected_state = selected_state
+                
+                # Statesaveをダウンロード
+                downloaded_path = self.api.download_state(selected_state.id, selected_state.file_name)
+                if downloaded_path:
+                    self.ui.draw_log(
+                        text_line_1=f"State downloaded: {selected_state.file_name_no_tags}",
+                        text_line_2=f"Location: {downloaded_path}"
+                    )
+                else:
+                    self.ui.draw_log(
+                        text_line_1=f"Failed to download state: {selected_state.file_name_no_tags}",
+                        text_line_2="Check network connection and permissions"
+                    )
+        elif self.input.key(self.controller_layout["b"]["key"]):
+            self.status.current_view = View.PLATFORMS
+            self.status.selected_state = None
+            self.status.reset_states_list()
+            self.states_selected_position = 0
+        elif self.input.key(self.controller_layout["y"]["key"]):
+            if self.status.states_ready.is_set():
+                self.status.states_ready.clear()
+                threading.Thread(target=self.api.fetch_states).start()
+        elif self.input.key("START"):
+            self.status.show_contextual_menu = not self.status.show_contextual_menu
+            if self.status.show_contextual_menu and len(self.status.states) > 0:
+                selected_state = self.status.states[self.states_selected_position]
+                self.contextual_menu_options = [
+                    (
+                        f"{glyphs.about} State info",
+                        0,
+                        lambda: self.ui.draw_log(
+                            text_line_1=f"State: {selected_state.file_name_no_tags}",
+                            text_line_2=f"Size: {self.api._human_readable_size(selected_state.file_size_bytes)[0]} {self.api._human_readable_size(selected_state.file_size_bytes)[1]} | Updated: {selected_state.updated_at}"
+                        ),
+                    ),
+                ]
+            else:
+                self.contextual_menu_options = []
+        else:
+            # Reset position if list is empty to avoid out-of-bounds
+            if len(self.status.states) == 0:
+                self.states_selected_position = 0
+            else:
+                self.states_selected_position = self.input.handle_navigation(
+                    self.states_selected_position,
+                    self.max_n_roms,  # 同じ最大数を使用
+                    len(self.status.states),
+                )
+
     def _render_contextual_menu(self):
         pos = [self.ui.screen_width / 3, self.ui.screen_height / 3]
         padding = 5
@@ -667,7 +919,7 @@ class RomM:
         pos = [self.ui.screen_width / 3, self.ui.screen_height / 3]
         padding = 6
         width = 200
-        n_selectable_options = 4 if self.fs._sd2_roms_storage_path else 3
+        n_selectable_options = 6 if self.fs._sd2_roms_storage_path else 5
         option_height = 28
         gap = 4
         title = "Main menu"
@@ -746,16 +998,32 @@ class RomM:
                     self._render_collections_view()
                 elif self.status.current_view == View.ROMS:
                     self._render_roms_view()
+                elif self.status.current_view == View.SAVES:
+                    self._render_saves_view()
+                elif self.status.current_view == View.STATES:
+                    self._render_states_view()
                 else:
                     self._render_platforms_view()
                 self.ui.render_to_screen()
             elif selected_pos == self.start_menu_options[3][1]:
+                # セーブデータビューに切り替え
+                self.status.current_view = View.SAVES
+                self.status.show_start_menu = False
+                self.status.saves_ready.clear()
+                threading.Thread(target=self.api.fetch_saves).start()
+            elif selected_pos == self.start_menu_options[4][1]:
+                # Statesaveビューに切り替え
+                self.status.current_view = View.STATES
+                self.status.show_start_menu = False
+                self.status.states_ready.clear()
+                threading.Thread(target=self.api.fetch_states).start()
+            elif selected_pos == self.start_menu_options[5][1]:
                 self.running = False
                 self.status.show_start_menu = False
         elif self.input.key(self.controller_layout["b"]["key"]):
             self.status.show_start_menu = not self.status.show_start_menu
         else:
-            n_selectable_options = 4 if self.fs._sd2_roms_storage_path else 3
+            n_selectable_options = 6 if self.fs._sd2_roms_storage_path else 5
             self.start_menu_selected_position = self.input.handle_navigation(
                 self.start_menu_selected_position,
                 n_selectable_options,
@@ -855,6 +1123,20 @@ class RomM:
                     and not self.status.show_contextual_menu
                 ):
                     self._update_roms_view()
+            elif self.status.current_view == View.SAVES:
+                self._render_saves_view()
+                if (
+                    not self.status.show_start_menu
+                    and not self.status.show_contextual_menu
+                ):
+                    self._update_saves_view()
+            elif self.status.current_view == View.STATES:
+                self._render_states_view()
+                if (
+                    not self.status.show_start_menu
+                    and not self.status.show_contextual_menu
+                ):
+                    self._update_states_view()
             else:
                 self._render_platforms_view()
                 if (

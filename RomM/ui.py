@@ -498,6 +498,108 @@ class UserInterface:
                 fill=fill,
             )
 
+    def draw_saves_list(
+        self,
+        saves_selected_position: int,
+        max_n_saves: int,
+        saves: list["SaveData"],
+        fill: Optional[str] = None,
+    ):
+        if fill is None:
+            fill = color_btn_a if self.layout_name == "nintendo" else color_btn_b
+
+        self.draw_rectangle_r(
+            [10, 50, self.screen_width - 10, 100], 5, outline=color_menu_bg
+        )
+        self.draw_text(
+            (self.screen_width / 2, 62),
+            "Savedata",
+            anchor="mm",
+        )
+        self.draw_rectangle_r(
+            [10, 70, self.screen_width - 10, self.screen_height - 43],
+            0,
+            fill=color_menu_bg,
+            outline=None,
+        )
+
+        start_idx = int(saves_selected_position / max_n_saves) * max_n_saves
+        end_idx = start_idx + max_n_saves
+
+        for i, save in enumerate(saves[start_idx:end_idx]):
+            is_selected = i == (saves_selected_position % max_n_saves)
+            
+            # サイズを人間が読みやすい形式に変換
+            size_value, size_unit = self._human_readable_size(save.file_size_bytes)
+            size_text = f"{size_value} {size_unit}"
+            
+            # セーブデータ情報を表示
+            row_text = f"{save.file_name_no_tags} ({size_text})"
+            
+            # テキストが長すぎる場合は短縮
+            if len(row_text) > 60:
+                row_text = row_text[:57] + "..."
+            
+            self.row_list(
+                row_text,
+                (20, 80 + (i * 35)),
+                self.screen_width - 40,
+                32,
+                is_selected,
+                fill=fill,
+            )
+
+    def draw_states_list(
+        self,
+        states_selected_position: int,
+        max_n_states: int,
+        states: list["StateSave"],
+        fill: Optional[str] = None,
+    ):
+        if fill is None:
+            fill = color_btn_a if self.layout_name == "nintendo" else color_btn_b
+
+        self.draw_rectangle_r(
+            [10, 50, self.screen_width - 10, 100], 5, outline=color_menu_bg
+        )
+        self.draw_text(
+            (self.screen_width / 2, 62),
+            "Statesave",
+            anchor="mm",
+        )
+        self.draw_rectangle_r(
+            [10, 70, self.screen_width - 10, self.screen_height - 43],
+            0,
+            fill=color_menu_bg,
+            outline=None,
+        )
+
+        start_idx = int(states_selected_position / max_n_states) * max_n_states
+        end_idx = start_idx + max_n_states
+
+        for i, state in enumerate(states[start_idx:end_idx]):
+            is_selected = i == (states_selected_position % max_n_states)
+            
+            # サイズを人間が読みやすい形式に変換
+            size_value, size_unit = self._human_readable_size(state.file_size_bytes)
+            size_text = f"{size_value} {size_unit}"
+            
+            # Statesave情報を表示
+            row_text = f"{state.file_name_no_tags} ({size_text})"
+            
+            # テキストが長すぎる場合は短縮
+            if len(row_text) > 60:
+                row_text = row_text[:57] + "..."
+            
+            self.row_list(
+                row_text,
+                (20, 80 + (i * 35)),
+                self.screen_width - 40,
+                32,
+                is_selected,
+                fill=fill,
+            )
+
     def draw_roms_list(
         self,
         roms_selected_position: int,
@@ -604,3 +706,14 @@ class UserInterface:
                 color_btn_a if UserInterface.layout_name == "nintendo" else color_btn_b
             ),
         )
+
+    def _human_readable_size(self, size_bytes: int) -> tuple[float, str]:
+        """サイズを人間が読みやすい形式に変換"""
+        if size_bytes == 0:
+            return 0, "B"
+        size_name = ("B", "KB", "MB", "GB")
+        import math
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return (s, size_name[i])

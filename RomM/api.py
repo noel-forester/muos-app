@@ -14,6 +14,7 @@ from filesystem import Filesystem
 from models import Collection, Platform, Rom
 from PIL import Image
 from status import Status, View
+import time
 
 
 class API:
@@ -24,6 +25,9 @@ class API:
     _roms_endpoint = "api/roms"
     _user_me_endpoint = "api/users/me"
     _user_profile_picture_url = "assets/romm/assets"
+    _saves_endpoint = "api/saves"
+    _auth_token_endpoint = "api/auth/token"
+    _states_endpoint = "api/states"
 
     def __init__(self):
         self.status = Status()
@@ -37,6 +41,11 @@ class API:
         self._include_collections = set(self._getenv_list("INCLUDE_COLLECTIONS"))
         self._exclude_collections = set(self._getenv_list("EXCLUDE_COLLECTIONS"))
         self._collection_type = os.getenv("COLLECTION_TYPE", "collection")
+
+        # セーブデータ関連
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expires_at = None
 
         if self.username and self.password:
             credentials = f"{self.username}:{self.password}"
@@ -71,8 +80,10 @@ class API:
     def _fetch_user_profile_picture(self, avatar_path: str) -> None:
         fs_extension = avatar_path.split(".")[-1]
         try:
+            # URLエンコーディングを追加してスペース文字を処理
+            encoded_avatar_path = quote(avatar_path)
             request = Request(
-                f"{self.host}/{self._user_profile_picture_url}/{avatar_path}",
+                f"{self.host}/{self._user_profile_picture_url}/{encoded_avatar_path}",
                 headers=self.headers,
             )
         except ValueError as e:
@@ -610,3 +621,505 @@ class API:
                 return
         # End of download
         self._reset_download_status(valid_host=True, valid_credentials=True)
+
+    def _get_access_token(self) -> bool:
+        """アクセストークンを取得する"""
+        try:
+            data = {
+                "grant_type": "password",
+                "username": self.username,
+                "password": self.password,
+                "scope": "assets:read"
+            }
+            data_str = "&".join([f"{k}={quote(str(v))}" for k, v in data.items()])
+            
+            request = Request(
+                f"{self.host}/{self._auth_token_endpoint}",
+                data=data_str.encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            
+            response = urlopen(request, timeout=60)
+            token_data = json.loads(response.read().decode("utf-8"))
+            
+            self.access_token = token_data.get("access_token")
+            self.refresh_token = token_data.get("refresh_token")
+            expires_in = token_data.get("expires_in", 1800)  # 30分
+            
+            if self.access_token:
+                self.token_expires_at = time.time() + expires_in
+                return True
+            return False
+        except HTTPError as e:
+            print(f"Failed to get access token: HTTP Error {e.code}: {e.reason}")
+            if e.code == 403:
+                print("Authentication failed - check username and password")
+            return False
+        except URLError as e:
+            print(f"Failed to get access token: URL Error {e}")
+            return False
+        except Exception as e:
+            print(f"Failed to get access token: {e}")
+            return False
+
+    def _refresh_access_token(self) -> bool:
+        """リフレッシュトークンを使ってアクセストークンを更新する"""
+        if not self.refresh_token:
+            return self._get_access_token()
+        
+        try:
+            data = {
+                "grant_type": "refresh_token",
+                "refresh_token": self.refresh_token
+            }
+            data_str = "&".join([f"{k}={quote(str(v))}" for k, v in data.items()])
+            
+            request = Request(
+                f"{self.host}/{self._auth_token_endpoint}",
+                data=data_str.encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            
+            response = urlopen(request, timeout=60)
+            token_data = json.loads(response.read().decode("utf-8"))
+            
+            self.access_token = token_data.get("access_token")
+            self.refresh_token = token_data.get("refresh_token")
+            expires_in = token_data.get("expires_in", 1800)
+            
+            if self.access_token:
+                self.token_expires_at = time.time() + expires_in
+                return True
+            return False
+        except HTTPError as e:
+            print(f"Failed to refresh access token: HTTP Error {e.code}: {e.reason}")
+            return self._get_access_token()
+        except URLError as e:
+            print(f"Failed to refresh access token: URL Error {e}")
+            return self._get_access_token()
+        except Exception as e:
+            print(f"Failed to refresh access token: {e}")
+            return self._get_access_token()
+
+    def _ensure_valid_token(self) -> bool:
+        """有効なアクセストークンを確保する"""
+        if not self.access_token:
+            return self._get_access_token()
+        
+        if self.token_expires_at and time.time() >= self.token_expires_at:
+            return self._refresh_access_token()
+        
+        return True
+
+    def fetch_saves(self, rom_id: str = None, platform_id: str = None) -> None:
+        """セーブデータ一覧を取得する"""
+        print("Fetching saves...")
+        # まず既存のBasic認証を試す
+        try:
+            url = f"{self.host}/{self._saves_endpoint}"
+            params = []
+            if rom_id:
+                params.append(f"rom_id={rom_id}")
+            if platform_id:
+                params.append(f"platform_id={platform_id}")
+            
+            if params:
+                url += "?" + "&".join(params)
+            
+            print(f"Trying Basic auth with URL: {url}")
+            # 既存のBasic認証ヘッダーを使用
+            request = Request(url, headers=self.headers)
+            
+            response = urlopen(request, timeout=60)
+            saves_data = json.loads(response.read().decode("utf-8"))
+            
+            print(f"Basic auth successful, got {len(saves_data)} saves")
+            from models import SaveData
+            self.status.saves = []
+            for save_data in saves_data:
+                save = SaveData(
+                    id=save_data.get("id"),
+                    rom_id=save_data.get("rom_id"),
+                    user_id=save_data.get("user_id"),
+                    file_name=save_data.get("file_name", ""),
+                    file_name_no_tags=save_data.get("file_name_no_tags", ""),
+                    file_name_no_ext=save_data.get("file_name_no_ext", ""),
+                    file_extension=save_data.get("file_extension", ""),
+                    file_path=save_data.get("file_path", ""),
+                    file_size_bytes=save_data.get("file_size_bytes", 0),
+                    full_path=save_data.get("full_path", ""),
+                    download_path=save_data.get("download_path", ""),
+                    missing_from_fs=save_data.get("missing_from_fs", False),
+                    created_at=save_data.get("created_at", ""),
+                    updated_at=save_data.get("updated_at", ""),
+                    emulator=save_data.get("emulator"),
+                    screenshot=save_data.get("screenshot")
+                )
+                self.status.saves.append(save)
+            
+            self.status.saves_ready.set()
+            return
+        except HTTPError as e:
+            print(f"Basic auth failed for saves API: {e.code}")
+            # Basic認証が失敗した場合、Bearer token認証を試す
+            pass
+        except Exception as e:
+            print(f"Basic auth failed for saves API: {e}")
+            pass
+        
+        print("Trying Bearer token auth...")
+        # Bearer token認証を試す
+        if not self._ensure_valid_token():
+            print("Failed to get valid token for saves API")
+            self.status.saves_ready.set()
+            return
+        
+        try:
+            url = f"{self.host}/{self._saves_endpoint}"
+            params = []
+            if rom_id:
+                params.append(f"rom_id={rom_id}")
+            if platform_id:
+                params.append(f"platform_id={platform_id}")
+            
+            if params:
+                url += "?" + "&".join(params)
+            
+            print(f"Trying Bearer auth with URL: {url}")
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            request = Request(url, headers=headers)
+            
+            response = urlopen(request, timeout=60)
+            saves_data = json.loads(response.read().decode("utf-8"))
+            
+            print(f"Bearer auth successful, got {len(saves_data)} saves")
+            from models import SaveData
+            self.status.saves = []
+            for save_data in saves_data:
+                save = SaveData(
+                    id=save_data.get("id"),
+                    rom_id=save_data.get("rom_id"),
+                    user_id=save_data.get("user_id"),
+                    file_name=save_data.get("file_name", ""),
+                    file_name_no_tags=save_data.get("file_name_no_tags", ""),
+                    file_name_no_ext=save_data.get("file_name_no_ext", ""),
+                    file_extension=save_data.get("file_extension", ""),
+                    file_path=save_data.get("file_path", ""),
+                    file_size_bytes=save_data.get("file_size_bytes", 0),
+                    full_path=save_data.get("full_path", ""),
+                    download_path=save_data.get("download_path", ""),
+                    missing_from_fs=save_data.get("missing_from_fs", False),
+                    created_at=save_data.get("created_at", ""),
+                    updated_at=save_data.get("updated_at", ""),
+                    emulator=save_data.get("emulator"),
+                    screenshot=save_data.get("screenshot")
+                )
+                self.status.saves.append(save)
+            
+            self.status.saves_ready.set()
+        except HTTPError as e:
+            print(f"Failed to fetch saves: HTTP Error {e.code}: {e.reason}")
+            self.status.saves_ready.set()
+        except URLError as e:
+            print(f"Failed to fetch saves: URL Error {e}")
+            self.status.saves_ready.set()
+        except Exception as e:
+            print(f"Failed to fetch saves: {e}")
+            self.status.saves_ready.set()
+
+    def fetch_save_detail(self, save_id: str) -> dict:
+        """特定のセーブデータの詳細を取得する"""
+        # まず既存のBasic認証を試す
+        try:
+            url = f"{self.host}/{self._saves_endpoint}/{save_id}"
+            request = Request(url, headers=self.headers)
+            
+            response = urlopen(request, timeout=60)
+            return json.loads(response.read().decode("utf-8"))
+        except HTTPError as e:
+            print(f"Basic auth failed for save detail API: {e.code}")
+            # Basic認証が失敗した場合、Bearer token認証を試す
+            pass
+        except Exception as e:
+            print(f"Basic auth failed for save detail API: {e}")
+            pass
+        
+        # Bearer token認証を試す
+        if not self._ensure_valid_token():
+            print("Failed to get valid token for save detail API")
+            return None
+        
+        try:
+            url = f"{self.host}/{self._saves_endpoint}/{save_id}"
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            request = Request(url, headers=headers)
+            
+            response = urlopen(request, timeout=60)
+            return json.loads(response.read().decode("utf-8"))
+        except HTTPError as e:
+            print(f"Failed to fetch save detail: HTTP Error {e.code}: {e.reason}")
+            return None
+        except URLError as e:
+            print(f"Failed to fetch save detail: URL Error {e}")
+            return None
+        except Exception as e:
+            print(f"Failed to fetch save detail: {e}")
+            return None
+
+    def download_save(self, save_id: str, save_name: str) -> None:
+        """セーブデータをダウンロードする"""
+        print(f"Downloading save: {save_name}")
+        
+        # まず既存のBasic認証を試す
+        try:
+            url = f"{self.host}/api/raw/assets/users/{self.username}/saves/{save_id}"
+            print(f"Trying Basic auth with URL: {url}")
+            
+            request = Request(url, headers=self.headers)
+            response = urlopen(request, timeout=60)
+            
+            # セーブデータ用のディレクトリを作成
+            saves_dir = os.path.join(self.file_system.get_roms_storage_path(), "saves")
+            os.makedirs(saves_dir, exist_ok=True)
+            
+            # ファイル名を安全にする
+            safe_filename = self._sanitize_filename(save_name)
+            file_path = os.path.join(saves_dir, safe_filename)
+            
+            with open(file_path, "wb") as f:
+                f.write(response.read())
+            
+            print(f"Save downloaded to: {file_path}")
+            return file_path
+            
+        except HTTPError as e:
+            print(f"Basic auth failed for save download: {e.code}")
+            pass
+        except Exception as e:
+            print(f"Basic auth failed for save download: {e}")
+            pass
+        
+        print("Trying Bearer token auth...")
+        # Bearer token認証を試す
+        if not self._ensure_valid_token():
+            print("Failed to get valid token for save download")
+            return None
+        
+        try:
+            url = f"{self.host}/api/raw/assets/users/{self.username}/saves/{save_id}"
+            print(f"Trying Bearer auth with URL: {url}")
+            
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            request = Request(url, headers=headers)
+            response = urlopen(request, timeout=60)
+            
+            # セーブデータ用のディレクトリを作成
+            saves_dir = os.path.join(self.file_system.get_roms_storage_path(), "saves")
+            os.makedirs(saves_dir, exist_ok=True)
+            
+            # ファイル名を安全にする
+            safe_filename = self._sanitize_filename(save_name)
+            file_path = os.path.join(saves_dir, safe_filename)
+            
+            with open(file_path, "wb") as f:
+                f.write(response.read())
+            
+            print(f"Save downloaded to: {file_path}")
+            return file_path
+            
+        except HTTPError as e:
+            print(f"Failed to download save: HTTP Error {e.code}: {e.reason}")
+            return None
+        except URLError as e:
+            print(f"Failed to download save: URL Error {e}")
+            return None
+        except Exception as e:
+            print(f"Failed to download save: {e}")
+            return None
+
+    def fetch_states(self, rom_id: str = None, platform_id: str = None) -> None:
+        """Statesave一覧を取得する"""
+        print("Fetching states...")
+        # まず既存のBasic認証を試す
+        try:
+            url = f"{self.host}/{self._states_endpoint}"
+            params = []
+            if rom_id:
+                params.append(f"rom_id={rom_id}")
+            if platform_id:
+                params.append(f"platform_id={platform_id}")
+            
+            if params:
+                url += "?" + "&".join(params)
+            
+            print(f"Trying Basic auth with URL: {url}")
+            # 既存のBasic認証ヘッダーを使用
+            request = Request(url, headers=self.headers)
+            
+            response = urlopen(request, timeout=60)
+            states_data = json.loads(response.read().decode("utf-8"))
+            
+            print(f"Basic auth successful, got {len(states_data)} states")
+            from models import StateSave
+            self.status.states = []
+            for state_data in states_data:
+                state = StateSave(
+                    id=state_data.get("id"),
+                    rom_id=state_data.get("rom_id"),
+                    user_id=state_data.get("user_id"),
+                    file_name=state_data.get("file_name", ""),
+                    file_name_no_tags=state_data.get("file_name_no_tags", ""),
+                    file_name_no_ext=state_data.get("file_name_no_ext", ""),
+                    file_extension=state_data.get("file_extension", ""),
+                    file_path=state_data.get("file_path", ""),
+                    file_size_bytes=state_data.get("file_size_bytes", 0),
+                    full_path=state_data.get("full_path", ""),
+                    download_path=state_data.get("download_path", ""),
+                    missing_from_fs=state_data.get("missing_from_fs", False),
+                    created_at=state_data.get("created_at", ""),
+                    updated_at=state_data.get("updated_at", ""),
+                    emulator=state_data.get("emulator"),
+                    screenshot=state_data.get("screenshot")
+                )
+                self.status.states.append(state)
+            
+            self.status.states_ready.set()
+            return
+        except HTTPError as e:
+            print(f"Basic auth failed for states API: {e.code}")
+            # Basic認証が失敗した場合、Bearer token認証を試す
+            pass
+        except Exception as e:
+            print(f"Basic auth failed for states API: {e}")
+            pass
+        
+        print("Trying Bearer token auth...")
+        # Bearer token認証を試す
+        if not self._ensure_valid_token():
+            print("Failed to get valid token for states API")
+            self.status.states_ready.set()
+            return
+        
+        try:
+            url = f"{self.host}/{self._states_endpoint}"
+            params = []
+            if rom_id:
+                params.append(f"rom_id={rom_id}")
+            if platform_id:
+                params.append(f"platform_id={platform_id}")
+            
+            if params:
+                url += "?" + "&".join(params)
+            
+            print(f"Trying Bearer auth with URL: {url}")
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            request = Request(url, headers=headers)
+            
+            response = urlopen(request, timeout=60)
+            states_data = json.loads(response.read().decode("utf-8"))
+            
+            print(f"Bearer auth successful, got {len(states_data)} states")
+            from models import StateSave
+            self.status.states = []
+            for state_data in states_data:
+                state = StateSave(
+                    id=state_data.get("id"),
+                    rom_id=state_data.get("rom_id"),
+                    user_id=state_data.get("user_id"),
+                    file_name=state_data.get("file_name", ""),
+                    file_name_no_tags=state_data.get("file_name_no_tags", ""),
+                    file_name_no_ext=state_data.get("file_name_no_ext", ""),
+                    file_extension=state_data.get("file_extension", ""),
+                    file_path=state_data.get("file_path", ""),
+                    file_size_bytes=state_data.get("file_size_bytes", 0),
+                    full_path=state_data.get("full_path", ""),
+                    download_path=state_data.get("download_path", ""),
+                    missing_from_fs=state_data.get("missing_from_fs", False),
+                    created_at=state_data.get("created_at", ""),
+                    updated_at=state_data.get("updated_at", ""),
+                    emulator=state_data.get("emulator"),
+                    screenshot=state_data.get("screenshot")
+                )
+                self.status.states.append(state)
+            
+            self.status.states_ready.set()
+        except HTTPError as e:
+            print(f"Failed to fetch states: HTTP Error {e.code}: {e.reason}")
+            self.status.states_ready.set()
+        except URLError as e:
+            print(f"Failed to fetch states: URL Error {e}")
+            self.status.states_ready.set()
+        except Exception as e:
+            print(f"Failed to fetch states: {e}")
+            self.status.states_ready.set()
+
+    def download_state(self, state_id: str, state_name: str) -> None:
+        """Statesaveをダウンロードする"""
+        print(f"Downloading state: {state_name}")
+        
+        # まず既存のBasic認証を試す
+        try:
+            url = f"{self.host}/api/raw/assets/users/{self.username}/states/{state_id}"
+            print(f"Trying Basic auth with URL: {url}")
+            
+            request = Request(url, headers=self.headers)
+            response = urlopen(request, timeout=60)
+            
+            # Statesave用のディレクトリを作成
+            states_dir = os.path.join(self.file_system.get_roms_storage_path(), "states")
+            os.makedirs(states_dir, exist_ok=True)
+            
+            # ファイル名を安全にする
+            safe_filename = self._sanitize_filename(state_name)
+            file_path = os.path.join(states_dir, safe_filename)
+            
+            with open(file_path, "wb") as f:
+                f.write(response.read())
+            
+            print(f"State downloaded to: {file_path}")
+            return file_path
+            
+        except HTTPError as e:
+            print(f"Basic auth failed for state download: {e.code}")
+            pass
+        except Exception as e:
+            print(f"Basic auth failed for state download: {e}")
+            pass
+        
+        print("Trying Bearer token auth...")
+        # Bearer token認証を試す
+        if not self._ensure_valid_token():
+            print("Failed to get valid token for state download")
+            return None
+        
+        try:
+            url = f"{self.host}/api/raw/assets/users/{self.username}/states/{state_id}"
+            print(f"Trying Bearer auth with URL: {url}")
+            
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            request = Request(url, headers=headers)
+            response = urlopen(request, timeout=60)
+            
+            # Statesave用のディレクトリを作成
+            states_dir = os.path.join(self.file_system.get_roms_storage_path(), "states")
+            os.makedirs(states_dir, exist_ok=True)
+            
+            # ファイル名を安全にする
+            safe_filename = self._sanitize_filename(state_name)
+            file_path = os.path.join(states_dir, safe_filename)
+            
+            with open(file_path, "wb") as f:
+                f.write(response.read())
+            
+            print(f"State downloaded to: {file_path}")
+            return file_path
+            
+        except HTTPError as e:
+            print(f"Failed to download state: HTTP Error {e.code}: {e.reason}")
+            return None
+        except URLError as e:
+            print(f"Failed to download state: URL Error {e}")
+            return None
+        except Exception as e:
+            print(f"Failed to download state: {e}")
+            return None
